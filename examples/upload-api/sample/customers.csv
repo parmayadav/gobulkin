@@ -1,0 +1,10 @@
+email,name,age,country,plan
+alice@example.com,Alice Smith,34,us,pro
+bob@example.com,Bob Jones,,GB,
+carol@example.com,Carol White,29,DE,enterprise
+not-an-email,Dave Brown,41,FR,free
+alice@example.com,Alice Again,35,US,free
+erin@example.com,,28,CA,free
+frank@example.com,Frank Green,200,US,free
+grace@example.com,Grace Hall,52,USA,free
+heidi@example.com,Heidi King,37,NL,gold

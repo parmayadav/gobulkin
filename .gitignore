@@ -1,0 +1,6 @@
+*.zip
+*.out
+coverage.txt
+.env
+.idea/
+.vscode/
