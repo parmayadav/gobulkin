@@ -2,6 +2,7 @@ package loader_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/jackc/pgx/v5"
@@ -12,10 +13,17 @@ import (
 type fakeDB struct {
 	// CopyErr, when set, makes every CopyFrom fail.
 	CopyErr error
+	// ExecErr, when set, makes every Exec fail.
+	ExecErr error
+	// FailOnCall, when positive, makes that CopyFrom call (1-based) fail.
+	FailOnCall int
+	// AfterCopy runs after each successful CopyFrom.
+	AfterCopy func()
 
 	mu         sync.Mutex
 	rows       [][]any
 	statements []string
+	calls      int
 }
 
 func (d *fakeDB) Rows() [][]any {
@@ -35,21 +43,35 @@ func (d *fakeDB) CopyFrom(_ context.Context, _ pgx.Identifier, _ []string, src p
 		return 0, d.CopyErr
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.calls++
+	if d.FailOnCall > 0 && d.calls == d.FailOnCall {
+		d.mu.Unlock()
+		return 0, errors.New("fake: copy failed")
+	}
 
 	var copied int64
 	for src.Next() {
 		values, err := src.Values()
 		if err != nil {
+			d.mu.Unlock()
 			return copied, err
 		}
 		d.rows = append(d.rows, values)
 		copied++
 	}
-	return copied, src.Err()
+	err := src.Err()
+	d.mu.Unlock()
+
+	if d.AfterCopy != nil {
+		d.AfterCopy()
+	}
+	return copied, err
 }
 
 func (d *fakeDB) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+	if d.ExecErr != nil {
+		return pgconn.CommandTag{}, d.ExecErr
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.statements = append(d.statements, sql)

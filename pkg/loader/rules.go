@@ -117,7 +117,11 @@ func (r *rules) checkKey(rec core.Record) error {
 		return nil
 	}
 	if first, duplicate := r.seen[r.keyOf(rec)]; duplicate {
-		return invalid(r.key[0], rec.Value(r.key[0]), "%s already appears on row %d", strings.Join(r.key, "+"), first)
+		reason := "already appears on row %d"
+		if len(r.key) > 1 {
+			reason = "is part of a key (" + strings.Join(r.key, "+") + ") that already appears on row %d"
+		}
+		return invalid(r.key[0], rec.Value(r.key[0]), reason, first)
 	}
 	return nil
 }

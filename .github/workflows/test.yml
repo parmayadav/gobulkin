@@ -9,13 +9,42 @@ permissions:
 
 jobs:
   test:
+    name: go ${{ matrix.go }}, postgres ${{ matrix.postgres }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.25.x"]
+        postgres: ["14", "15", "16", "17"]
+        include:
+          - go: stable
+            postgres: "17"
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: gobulkin
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/gobulkin?sslmode=disable
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25.x"
+          go-version: ${{ matrix.go }}
       - run: go mod tidy
       - run: test -z "$(gofmt -s -l .)"
       - run: go vet ./...
-      - run: go test -race ./...
+      - run: go test -race -count=1 ./...
+      - name: Smoke-test the benchmarks
+        run: go test -run '^$' -bench . -benchtime=1x ./pkg/loader/

@@ -1,5 +1,10 @@
 # gobulkin
 
+[![Go Tests](https://github.com/parmayadav/gobulkin/actions/workflows/test.yml/badge.svg)](https://github.com/parmayadav/gobulkin/actions/workflows/test.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/parmayadav/gobulkin.svg)](https://pkg.go.dev/github.com/parmayadav/gobulkin/pkg/loader)
+![Go 1.25+](https://img.shields.io/badge/go-1.25%2B-00ADD8)
+![PostgreSQL 14-17](https://img.shields.io/badge/postgresql-14%E2%80%9317-336791)
+
 A Go library for backend services that accept CSV or XLSX uploads. Describe your table once,
 call one method per file, and gobulkin validates every row and bulk-loads the valid ones into
 PostgreSQL through a transaction you control.
@@ -25,8 +30,9 @@ and reports what it found.
 | `pkg/loader` | **Start here.** Column spec in, validated rows written to a transaction, report out | pgx, excelize |
 | `pkg/core` | `Import`, hooks, `Record`, `Header`, `Source` | none |
 | `pkg/postgres` | COPY `Writer` and `Upserter` | pgx |
+| `examples/quickstart` | Smallest runnable program: import a file, print the report | pgx |
 | `examples/upload-api` | HTTP upload service built on `loader` | pgx |
-| `docs` | Architecture notes | |
+| `docs` | Architecture notes and benchmarks | |
 
 The CSV and XLSX readers are private to `loader`. `core` knows nothing about files or
 databases, so it adds no dependencies to your build.
@@ -36,6 +42,53 @@ databases, so it adds no dependencies to your build.
     go get github.com/parmayadav/gobulkin
 
 Requires Go 1.25 or newer.
+
+## Try it in five minutes
+
+You need Go and Docker. The sample file `examples/quickstart/customers.csv` has 9 rows, 3 of them
+valid and 6 deliberately broken (bad email, duplicate email, missing name, age out of range,
+bad country, unknown plan).
+
+```sh
+docker run -d --name gobulkin-demo -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=demo -p 5432:5432 postgres:17
+export DATABASE_URL='postgres://postgres:pw@localhost:5432/demo?sslmode=disable'
+
+go run ./examples/quickstart            # all-or-nothing: the broken rows block the import
+go run ./examples/quickstart -partial   # partial: save the 3 valid rows
+```
+
+Both runs print the same report, shown here with the whitespace condensed:
+
+```json
+{
+  "completed": true,
+  "rows_read": 9,
+  "rows_accepted": 3,
+  "rows_rejected": 6,
+  "rows_written": 3,
+  "errors": [
+    {"row": 4, "column": "email",   "message": "email is not a valid address"},
+    {"row": 5, "column": "email",   "message": "email already appears on row 1"},
+    {"row": 6, "column": "name",    "message": "name is required"},
+    {"row": 7, "column": "age",     "message": "age must be between 0 and 130"},
+    {"row": 8, "column": "country", "message": "country must be a two-letter ISO code"},
+    {"row": 9, "column": "plan",    "message": "plan must be one of free, pro, enterprise"}
+  ],
+  "committed": false
+}
+```
+
+The only difference is the last field and what is in the table afterwards:
+
+| Command | `committed` | Rows in `customers` |
+| --- | --- | --- |
+| `go run ./examples/quickstart` | `false` (all-or-nothing: any rejected row rolls back) | 0 |
+| `go run ./examples/quickstart -partial` | `true` | 3 (alice, bob, carol) |
+
+`completed: true` means the import ran to the end without an error; it says nothing about the
+policy. The decision to commit or roll back is the program's, in about three lines (see
+[examples/quickstart/main.go](examples/quickstart/main.go)). Point `-file` at your own CSV or XLSX
+to try your data; `docker rm -f gobulkin-demo` cleans up.
 
 ## Quick start
 
@@ -160,6 +213,33 @@ The loader only writes through the `loader.Tx` you pass (anything with `CopyFrom
 
 Use one transaction per import. Beginning it before the body is read keeps a connection busy
 while a slow client uploads, so read the file part first if that matters.
+
+### Partial or all-or-nothing
+
+The loader never decides this for you. Both policies are the same call; only what you do with
+the report differs.
+
+| | All-or-nothing | Partial |
+| --- | --- | --- |
+| When to use | The file is a unit: a corrected file will be re-uploaded in full | Rows are independent and the uploader can fix and resend only the rejected ones |
+| After `ImportFile` | If `report.HasRejectedRows()`, **roll back** and return `report.Errors` | **Commit** whatever the report says |
+| Database afterwards | Unchanged when any row was rejected | The valid rows are saved, the rejected ones are not |
+| Report | `rows_rejected > 0`, `committed: false` (in the example service) | `rows_rejected > 0`, `committed: true` |
+
+```go
+report, err := customers.ImportFile(ctx, tx, name, file, loader.Options{})
+if err != nil {
+    return err // roll back in both policies
+}
+if report.HasRejectedRows() && !allowPartial {
+    return report.Errors // all-or-nothing
+}
+return tx.Commit(ctx)
+```
+
+In both policies the report lists every bad row (up to `MaxReportedIssues`), so the uploader
+sees all problems in one pass instead of fixing them one at a time. A database failure is
+different: it is an `error`, and you roll back whichever policy you chose.
 
 ### Untrusted uploads
 
@@ -367,14 +447,50 @@ Other statuses: `400` for a bad file or header, `401` without the API key, `413`
 
     make check
 
-runs `gofmt`, `go mod tidy`, `go vet` and the tests with the race detector; CI does the same.
-The loader tests use an in-memory fake, so they need no database. The integration test in
-`examples/upload-api/store_test.go` runs against a real PostgreSQL only when `TEST_DATABASE_URL`
-is set, using a throwaway schema:
+runs `gofmt`, `go mod tidy`, `go vet` and the tests with the race detector.
+The architecture notes are in [docs/architecture.md](docs/architecture.md).
+
+## Reliability
+
+CI runs on every push and pull request against a real PostgreSQL service container:
+
+| Go | PostgreSQL |
+| --- | --- |
+| 1.25.x (the minimum) | 14, 15, 16, 17 |
+| stable | 17 |
+
+The suite also ran locally on Go 1.27.1 against PostgreSQL 14.24, 15.19, 16.15 and 17.11.
+
+What the tests cover, with and without a database:
+
+| Area | Tests |
+| --- | --- |
+| Malformed CSV | Unterminated and bare quotes, ragged rows, a broken header, binary content, an empty file; and valid oddities that must still work (BOM, CRLF, blank lines, no trailing newline) |
+| Malformed XLSX | Not a zip, truncated workbook, empty file, unknown sheet, empty sheet, duplicate or missing header columns |
+| Cancellation and timeout | Cancelled before start, cancelled between batches (only the first batch is written), deadline exceeded |
+| Duplicate keys | Repeats within a file (case and spacing ignored), composite keys, a rejected row not reserving its key, an existing row with and without `Key` |
+| Partial failures | A later batch fails after an earlier one was written, the merge step fails, rejected rows plus a failing write |
+| Transactions | The loader never calls commit or rollback; against a real database, rollback leaves nothing and a constraint violation mid-import followed by rollback leaves nothing, with and without `Key` |
+| Scale | Many batches, typed values, and the benchmark harness itself in CI |
+
+The unit tests use an in-memory fake and need no database. The tests marked above as running
+against a real PostgreSQL (`pkg/loader/integration_test.go` and the example's
+`store_test.go`) run when `TEST_DATABASE_URL` is set, each in a throwaway schema:
 
     TEST_DATABASE_URL='postgres://user:pass@localhost:5432/db?sslmode=disable' make check
 
-The architecture notes are in [docs/architecture.md](docs/architecture.md).
+## Performance
+
+Medians from one Apple M4 Pro with PostgreSQL 16 in Docker; setup, method and caveats are in
+[docs/benchmarks.md](docs/benchmarks.md).
+
+| | Result |
+| --- | --- |
+| Validate and batch CSV, no database | about 1.1 million rows/s |
+| Validate and batch XLSX, no database | about 149,000 rows/s |
+| Peak heap while importing 10k, 100k and 1M CSV rows | 2.7 MB each time |
+| Import 100,000 rows into PostgreSQL | loader (validate + COPY) 308,000 rows/s, hand-written batched `INSERT` 252,000 rows/s |
+| One `INSERT` per row (10,000 rows) | 4,100 rows/s, about 70 times slower |
 
 ## Status
 
